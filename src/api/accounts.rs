@@ -130,6 +130,65 @@ mod accounts_signing {
             Ok(signed)
         }
 
+        ///fill tx
+        pub async fn fill_transaction (
+            &self,
+            tx: TransactionParameters,
+            from: &Address,
+        ) -> error::Result<TxWithID> {
+            macro_rules! maybe {
+                ($o: expr, $f: expr) => {
+                    async {
+                        match $o {
+                            Some(value) => Ok(value),
+                            None => $f.await,
+                        }
+                    }
+                };
+            }
+
+            let gas_price = match tx.transaction_type {
+                Some(tx_type) if tx_type == U64::from(EIP1559_TX_ID) && tx.max_fee_per_gas.is_some() => {
+                    tx.max_fee_per_gas
+                }
+                _ => tx.gas_price,
+            };
+
+            let (nonce, gas_price, chain_id) = futures::future::try_join3(
+                maybe!(tx.nonce, self.web3().eth().transaction_count(from.clone(), None)),
+                maybe!(gas_price, self.web3().eth().gas_price()),
+                maybe!(tx.chain_id.map(U256::from), self.web3().eth().chain_id()),
+            )
+            .await?;
+            let chain_id = chain_id.as_u64();
+
+            let max_priority_fee_per_gas = match tx.transaction_type {
+                Some(tx_type) if tx_type == U64::from(EIP1559_TX_ID) => {
+                    tx.max_priority_fee_per_gas.unwrap_or(gas_price)
+                }
+                _ => gas_price,
+            };
+
+            let tx = Transaction {
+                to: tx.to,
+                nonce,
+                gas: tx.gas,
+                gas_price,
+                value: tx.value,
+                data: tx.data.0,
+                transaction_type: tx.transaction_type,
+                access_list: tx.access_list.unwrap_or_default(),
+                max_priority_fee_per_gas,
+            };
+
+            let tx_ci = TxWithID {
+                tx:tx,
+                chain_id:chain_id,
+            };
+            Ok(tx_ci)
+        }
+
+
         /// Sign arbitrary string data.
         ///
         /// The data is UTF-8 encoded and enveloped the same way as with
@@ -194,7 +253,7 @@ mod accounts_signing {
         }
     }
     /// A transaction used for RLP encoding, hashing and signing.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct Transaction {
         pub to: Option<Address>,
         pub nonce: U256,
@@ -360,8 +419,23 @@ mod accounts_signing {
                 transaction_hash,
             }
         }
+
+        pub fn tx_raw_transaction(self, chain_id: u64, sig: &Signature) -> Bytes {
+            self.encode(chain_id, Some(sig)).into()
+        }
+
+        pub fn tx_hash(self, chain_id: u64) -> [u8;32] {
+            let encoded = self.encode(chain_id, None);
+            signing::keccak256(encoded.as_ref())
+        }
+    }
+
+    pub struct TxWithID {
+        pub tx: Transaction,
+        pub chain_id: u64,
     }
 }
+
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
